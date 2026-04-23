@@ -1,11 +1,24 @@
 <!doctype html>
 <html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>thermal-comfort</title>
-  </head>
+ <head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <title>Thermal Comfort</title>
+  <meta name="description" content="Online learning model for AC setpoint preferences" />
+
+  <!-- PWA manifest -->
+  <link rel="manifest" href="/manifest.json" />
+  <meta name="theme-color" content="#209CEE" />
+
+  <!-- Icons -->
+  <link rel="icon" type="image/png" href="/icon-192.png" />
+  <link rel="apple-touch-icon" href="/icon-192.png" />
+
+  <!-- iOS specific: makes Safari launch fullscreen when pinned -->
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+  <meta name="apple-mobile-web-app-title" content="Thermal" />
+</head>
   <body>
     <div id="root"></div>
     <script type="module" src="/src/main.jsx"></script>
