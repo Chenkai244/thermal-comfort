@@ -9,7 +9,7 @@ import {
   ResponsiveContainer,
   Legend,
 } from "recharts";
-import { RotateCcw, Sparkles, Check } from "lucide-react";
+import { RotateCcw, Sparkles, Check, CloudSun } from "lucide-react";
 
 // 80 pretrained (slope, intercept) pairs from the CSV
 const MODELS = [
@@ -54,24 +54,28 @@ const INK = "#2a1f1a";
 const MUTED = "#7a6350";
 const RULE = "#d6c7ae";
 const HEAT = "#b54728";
-const HEAT_SOFT = "#e8c2b1";
 const COOL = "#3a6d7a";
 const COOL_SOFT = "#bcd4d9";
+const SKY = "#8a6f3e";
+const SKY_SOFT = "#e8dcc0";
 
-// Demo sequence to showcase the model learning
+// Demo sequence — each step carries a forecast for the NEXT step's Tout
+// (so at step j, the forecast equals T_{j+1} — exactly what the R script peeks at)
 const DEMO_SEQ = [
-  { Tout: 28, setpoint: 25 },
-  { Tout: 30, setpoint: 24 },
-  { Tout: 32, setpoint: 23.5 },
-  { Tout: 34, setpoint: 23 },
-  { Tout: 31, setpoint: 24 },
-  { Tout: 35, setpoint: 22.5 },
-  { Tout: 29, setpoint: 24.5 },
+  { Tout: 28, setpoint: 25,   forecast: 30   },
+  { Tout: 30, setpoint: 24,   forecast: 32   },
+  { Tout: 32, setpoint: 23.5, forecast: 34   },
+  { Tout: 34, setpoint: 23,   forecast: 31   },
+  { Tout: 31, setpoint: 24,   forecast: 35   },
+  { Tout: 35, setpoint: 22.5, forecast: 29   },
+  { Tout: 29, setpoint: 24.5, forecast: null },
 ];
 
 export default function App() {
   const [tout, setTout] = useState(30);
   const [setpoint, setSetpoint] = useState(24);
+  const [useForecast, setUseForecast] = useState(false);
+  const [forecastNext, setForecastNext] = useState(30);
   const [history, setHistory] = useState([]);
   const [errorsMatrix, setErrorsMatrix] = useState([]);
   const [bestIdx, setBestIdx] = useState(null);
@@ -91,14 +95,16 @@ export default function App() {
     };
   }, []);
 
-  // Live prediction using the currently selected model
+  // Live prediction using the currently selected model, driven by current Tout slider
   const livePrediction = useMemo(() => {
     if (bestIdx === null) return null;
     const m = MODELS[bestIdx];
     return tout * m.s + m.i;
   }, [tout, bestIdx]);
 
-  function submit(toutVal, spVal) {
+  // Core update step. If boostRef is provided, it replaces toutVal as the
+  // reference in the similar-temperature weight boost (R-style lookahead).
+  function submit(toutVal, spVal, boostRef = null) {
     if (toutVal < CUTOFF) return;
     const sp = Math.max(17, Math.min(29, spVal));
 
@@ -108,7 +114,7 @@ export default function App() {
         ? toutVal * MODELS[bestIdx].s + MODELS[bestIdx].i
         : null;
 
-    // New errors column: squared error of every model on this observation
+    // Squared error of every model on this observation
     const newCol = MODELS.map((m) => {
       const pred = toutVal * m.s + m.i;
       return (pred - sp) ** 2;
@@ -122,11 +128,15 @@ export default function App() {
       (_, k) => ALPHA ** (nCols - 1 - k)
     );
 
-    // Boost weights for past observations at similar outdoor temperatures
+    // Reference Tout for the similar-temperature boost:
+    //   • if a forecast is provided → R-style (T_{j+1} lookahead)
+    //   • otherwise                 → JS fallback (current T_j)
+    const actualBoostRef = boostRef !== null ? boostRef : toutVal;
+
     const allTouts = [...history.map((h) => h.Tout), toutVal];
     const similarIdx = [];
     for (let k = 0; k < allTouts.length; k++) {
-      if (Math.abs(allTouts[k] - toutVal) < THRESHOLD) similarIdx.push(k);
+      if (Math.abs(allTouts[k] - actualBoostRef) < THRESHOLD) similarIdx.push(k);
     }
     if (similarIdx.length > 0) {
       for (let k = 0; k < similarIdx.length; k++) {
@@ -160,6 +170,7 @@ export default function App() {
         Tout: toutVal,
         setpoint: sp,
         predicted: predictedValue,
+        forecast: boostRef,
       },
     ]);
 
@@ -168,7 +179,8 @@ export default function App() {
   }
 
   function handleSubmit() {
-    submit(tout, setpoint);
+    // Pass the forecast only when forecast mode is enabled
+    submit(tout, setpoint, useForecast ? forecastNext : null);
   }
 
   function reset() {
@@ -197,9 +209,14 @@ export default function App() {
       const step = DEMO_SEQ[demoIdxRef.current];
       setTout(step.Tout);
       setSetpoint(step.setpoint);
-      submit(step.Tout, step.setpoint);
+      if (useForecast && step.forecast !== null) {
+        setForecastNext(step.forecast);
+        submit(step.Tout, step.setpoint, step.forecast);
+      } else {
+        submit(step.Tout, step.setpoint, null);
+      }
       demoIdxRef.current += 1;
-    }, 700);
+    }, 750);
     return () => clearTimeout(t);
     // eslint-disable-next-line
   }, [demoRunning, history.length]);
@@ -270,9 +287,9 @@ export default function App() {
         }
         input[type=range].thermal-slider.cool::-webkit-slider-thumb { border-color: ${COOL}; }
         input[type=range].thermal-slider.cool::-moz-range-thumb { border-color: ${COOL}; }
-        .grain {
-          position: relative;
-        }
+        input[type=range].thermal-slider.sky::-webkit-slider-thumb { border-color: ${SKY}; }
+        input[type=range].thermal-slider.sky::-moz-range-thumb { border-color: ${SKY}; }
+        .grain { position: relative; }
         .grain::before {
           content: "";
           position: absolute;
@@ -281,13 +298,31 @@ export default function App() {
           opacity: 0.035;
           background-image: url("data:image/svg+xml;utf8,<svg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2'/></filter><rect width='200' height='200' filter='url(%23n)'/></svg>");
         }
-        .pulse-check {
-          animation: pulse 0.7s ease-out;
-        }
+        .pulse-check { animation: pulse 0.7s ease-out; }
         @keyframes pulse {
           0% { transform: scale(0.6); opacity: 0; }
           50% { transform: scale(1.1); opacity: 1; }
           100% { transform: scale(1); opacity: 1; }
+        }
+        .toggle-pill {
+          width: 40px; height: 22px; border-radius: 999px;
+          position: relative; cursor: pointer; transition: background 0.2s;
+          flex-shrink: 0;
+        }
+        .toggle-pill::after {
+          content: ""; position: absolute; top: 2px; left: 2px;
+          width: 18px; height: 18px; border-radius: 50%;
+          background: ${PAPER}; box-shadow: 0 1px 3px rgba(42,31,26,0.2);
+          transition: transform 0.2s;
+        }
+        .toggle-pill.on::after { transform: translateX(18px); }
+        .fade-in {
+          animation: fadeIn 0.35s ease-out;
+          overflow: hidden;
+        }
+        @keyframes fadeIn {
+          from { opacity: 0; max-height: 0; }
+          to { opacity: 1; max-height: 220px; }
         }
       `}</style>
 
@@ -298,7 +333,7 @@ export default function App() {
             className="text-xs tracking-widest mb-3 uppercase"
             style={{ fontFamily: monoStack, color: MUTED, letterSpacing: "0.22em" }}
           >
-            online learning · v1
+            online learning · v2
           </div>
           <h1
             style={{
@@ -320,6 +355,53 @@ export default function App() {
             A model that learns your air-conditioning preferences by watching what you set.
           </div>
         </header>
+
+        {/* Mode toggle */}
+        <div
+          className="rounded-2xl p-4 mb-4 flex items-center justify-between gap-3"
+          style={{
+            background: useForecast ? `${SKY_SOFT}70` : "transparent",
+            border: `1px solid ${useForecast ? SKY : RULE}`,
+            transition: "all 0.25s",
+          }}
+        >
+          <div className="flex items-center gap-3">
+            <CloudSun size={18} style={{ color: useForecast ? SKY : MUTED, flexShrink: 0 }} />
+            <div>
+              <div
+                className="text-xs uppercase"
+                style={{ fontFamily: monoStack, color: useForecast ? SKY : MUTED, letterSpacing: "0.16em" }}
+              >
+                forecast mode
+              </div>
+              <div
+                style={{
+                  fontFamily: fontStack,
+                  fontSize: "0.82rem",
+                  color: MUTED,
+                  fontStyle: "italic",
+                  lineHeight: 1.35,
+                  marginTop: "2px",
+                }}
+              >
+                {useForecast
+                  ? "using tomorrow's forecast to select model (matches R)"
+                  : "uses today's Tout as fallback boost reference"}
+              </div>
+            </div>
+          </div>
+          <div
+            role="switch"
+            aria-checked={useForecast}
+            tabIndex={0}
+            className={`toggle-pill ${useForecast ? "on" : ""}`}
+            onClick={() => setUseForecast((v) => !v)}
+            onKeyDown={(e) => {
+              if (e.key === " " || e.key === "Enter") { e.preventDefault(); setUseForecast((v) => !v); }
+            }}
+            style={{ background: useForecast ? SKY : RULE }}
+          />
+        </div>
 
         {/* Main card */}
         <div
@@ -465,6 +547,69 @@ export default function App() {
               onChange={(e) => setSetpoint(parseFloat(e.target.value))}
             />
           </div>
+
+          {/* Forecast next Tout (only when forecast mode is on) */}
+          {useForecast && (
+            <div className="mb-6 fade-in">
+              <div
+                className="flex items-baseline justify-between mb-1"
+                style={{ paddingTop: "4px" }}
+              >
+                <label
+                  className="text-xs uppercase"
+                  style={{ fontFamily: monoStack, color: SKY, letterSpacing: "0.16em" }}
+                >
+                  next day forecast
+                </label>
+                <span
+                  className="text-xs"
+                  style={{ fontFamily: monoStack, color: MUTED }}
+                >
+                  T_{'{j+1}'}
+                </span>
+              </div>
+              <div className="flex items-baseline gap-2 mb-3">
+                <span
+                  style={{
+                    fontFamily: fontStack,
+                    fontSize: "2.6rem",
+                    fontWeight: 300,
+                    lineHeight: 1,
+                    letterSpacing: "-0.04em",
+                    color: SKY,
+                  }}
+                >
+                  {forecastNext.toFixed(1)}
+                </span>
+                <span
+                  style={{
+                    fontFamily: fontStack,
+                    fontSize: "1.2rem",
+                    fontWeight: 300,
+                    color: SKY,
+                    fontStyle: "italic",
+                  }}
+                >
+                  °c
+                </span>
+              </div>
+              <input
+                type="range"
+                className="thermal-slider sky"
+                min={CUTOFF}
+                max={45}
+                step={0.5}
+                value={forecastNext}
+                onChange={(e) => setForecastNext(parseFloat(e.target.value))}
+              />
+              <div
+                className="text-xs italic mt-2"
+                style={{ fontFamily: fontStack, color: MUTED, lineHeight: 1.45 }}
+              >
+                boosts weights of past days within {THRESHOLD}° of this value
+              </div>
+            </div>
+          )}
 
           {/* Submit */}
           <button
@@ -705,7 +850,7 @@ export default function App() {
         >
           80 pretrained models · α = {ALPHA} · threshold = {THRESHOLD}°
           <br />
-          cooling-mode cutoff ≥ {CUTOFF}°c
+          boost ref: {useForecast ? "next-day forecast (R-style)" : "current T (fallback)"}
         </div>
       </div>
     </div>
