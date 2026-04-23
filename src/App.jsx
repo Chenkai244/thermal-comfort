@@ -9,7 +9,7 @@ import {
   ResponsiveContainer,
   Legend,
 } from "recharts";
-import { RotateCcw, Sparkles, Check, CloudSun } from "lucide-react";
+import { RotateCcw, Sparkles, Check } from "lucide-react";
 
 // 80 pretrained (slope, intercept) pairs from the CSV
 const MODELS = [
@@ -59,6 +59,29 @@ const COOL_SOFT = "#bcd4d9";
 const SKY = "#8a6f3e";
 const SKY_SOFT = "#e8dcc0";
 
+// Archetype chart geometry (outdoor-temp vs preferred-setpoint, 80 pre-trained lines)
+const AW = 400;
+const AH = 260;
+const AX_PAD = { left: 52, right: 16, top: 14, bottom: 44 };
+const APW = AW - AX_PAD.left - AX_PAD.right;
+const APH = AH - AX_PAD.top - AX_PAD.bottom;
+const AX_MIN = 18;
+const AX_MAX = 45;
+const AY_MIN = 15;
+const AY_MAX = 30;
+const axScale = (x) =>
+  AX_PAD.left + ((x - AX_MIN) / (AX_MAX - AX_MIN)) * APW;
+const ayScale = (y) =>
+  AX_PAD.top + (1 - (y - AY_MIN) / (AY_MAX - AY_MIN)) * APH;
+// Precompute the endpoints of every model line so we don't recompute per-render
+const MODEL_LINES = MODELS.map((m, idx) => ({
+  idx,
+  x1: axScale(AX_MIN),
+  y1: ayScale(AX_MIN * m.s + m.i),
+  x2: axScale(AX_MAX),
+  y2: ayScale(AX_MAX * m.s + m.i),
+}));
+
 // Demo sequence — each step carries a forecast for the NEXT step's Tout
 // (so at step j, the forecast equals T_{j+1} — exactly what the R script peeks at)
 const DEMO_SEQ = [
@@ -74,14 +97,15 @@ const DEMO_SEQ = [
 export default function App() {
   const [tout, setTout] = useState(30);
   const [setpoint, setSetpoint] = useState(24);
-  const [useForecast, setUseForecast] = useState(false);
-  const [forecastNext, setForecastNext] = useState(30);
   const [history, setHistory] = useState([]);
   const [errorsMatrix, setErrorsMatrix] = useState([]);
   const [bestIdx, setBestIdx] = useState(null);
   const [justRecorded, setJustRecorded] = useState(false);
   const [demoRunning, setDemoRunning] = useState(false);
+  const [hoverTout, setHoverTout] = useState(null);
+  const [forecastTout, setForecastTout] = useState(""); // string so empty = no forecast
   const demoIdxRef = useRef(0);
+  const archetypeSvgRef = useRef(null);
 
   // Load elegant fonts
   useEffect(() => {
@@ -94,13 +118,6 @@ export default function App() {
       try { document.head.removeChild(link); } catch (e) {}
     };
   }, []);
-
-  // Live prediction using the currently selected model, driven by current Tout slider
-  const livePrediction = useMemo(() => {
-    if (bestIdx === null) return null;
-    const m = MODELS[bestIdx];
-    return tout * m.s + m.i;
-  }, [tout, bestIdx]);
 
   // Core update step. If boostRef is provided, it replaces toutVal as the
   // reference in the similar-temperature weight boost (R-style lookahead).
@@ -128,21 +145,21 @@ export default function App() {
       (_, k) => ALPHA ** (nCols - 1 - k)
     );
 
-    // Reference Tout for the similar-temperature boost:
-    //   • if a forecast is provided → R-style (T_{j+1} lookahead)
-    //   • otherwise                 → JS fallback (current T_j)
-    const actualBoostRef = boostRef !== null ? boostRef : toutVal;
-
-    const allTouts = [...history.map((h) => h.Tout), toutVal];
-    const similarIdx = [];
-    for (let k = 0; k < allTouts.length; k++) {
-      if (Math.abs(allTouts[k] - actualBoostRef) < THRESHOLD) similarIdx.push(k);
-    }
-    if (similarIdx.length > 0) {
-      for (let k = 0; k < similarIdx.length; k++) {
-        const idx = similarIdx[k];
-        const newW = ALPHA ** (similarIdx.length - 1 - k);
-        weights[idx] = Math.max(weights[idx], newW);
+    // Similar-temperature weight boost — matches new R code exactly.
+    // Only applied when a forecast for the NEXT Tout is provided.
+    // Without a forecast, we rely on pure alpha decay (no fallback).
+    if (boostRef !== null) {
+      const allTouts = [...history.map((h) => h.Tout), toutVal];
+      const similarIdx = [];
+      for (let k = 0; k < allTouts.length; k++) {
+        if (Math.abs(allTouts[k] - boostRef) < THRESHOLD) similarIdx.push(k);
+      }
+      if (similarIdx.length > 0) {
+        for (let k = 0; k < similarIdx.length; k++) {
+          const idx = similarIdx[k];
+          const newW = ALPHA ** (similarIdx.length - 1 - k);
+          weights[idx] = Math.max(weights[idx], newW);
+        }
       }
     }
 
@@ -179,8 +196,10 @@ export default function App() {
   }
 
   function handleSubmit() {
-    // Pass the forecast only when forecast mode is enabled
-    submit(tout, setpoint, useForecast ? forecastNext : null);
+    // Parse forecast: empty string / invalid input → null (pure alpha-decay only)
+    const parsed = parseFloat(forecastTout);
+    const fc = Number.isFinite(parsed) ? parsed : null;
+    submit(tout, setpoint, fc);
   }
 
   function reset() {
@@ -188,6 +207,7 @@ export default function App() {
     setErrorsMatrix([]);
     setBestIdx(null);
     setDemoRunning(false);
+    setForecastTout("");
     demoIdxRef.current = 0;
   }
 
@@ -209,36 +229,52 @@ export default function App() {
       const step = DEMO_SEQ[demoIdxRef.current];
       setTout(step.Tout);
       setSetpoint(step.setpoint);
-      if (useForecast && step.forecast !== null) {
-        setForecastNext(step.forecast);
-        submit(step.Tout, step.setpoint, step.forecast);
-      } else {
-        submit(step.Tout, step.setpoint, null);
-      }
+      submit(step.Tout, step.setpoint, step.forecast ?? null);
       demoIdxRef.current += 1;
     }, 750);
     return () => clearTimeout(t);
     // eslint-disable-next-line
   }, [demoRunning, history.length]);
 
-  // Stats
-  const stats = useMemo(() => {
-    const withPred = history.filter((h) => h.predicted !== null);
-    const errs = withPred.map((h) => Math.abs(h.predicted - h.setpoint));
-    const mean = errs.length
-      ? errs.reduce((a, b) => a + b, 0) / errs.length
-      : null;
-    return { mean, count: history.length, predCount: withPred.length };
-  }, [history]);
-
   const currentModel = bestIdx !== null ? MODELS[bestIdx] : null;
 
-  // Chart data
-  const chartData = history.map((h) => ({
-    step: h.step,
-    actual: h.setpoint,
-    predicted: h.predicted,
-  }));
+  // Chart data — hide the first reading per UI spec
+  const chartData = history
+    .filter((h) => h.step > 1)
+    .map((h) => ({
+      step: h.step,
+      actual: h.setpoint,
+      predicted: h.predicted,
+    }));
+
+  // Hover point on the selected archetype line
+  const hoverPoint = useMemo(() => {
+    if (hoverTout === null || bestIdx === null) return null;
+    const m = MODELS[bestIdx];
+    const y = hoverTout * m.s + m.i;
+    if (y < AY_MIN || y > AY_MAX) return null;
+    return { x: hoverTout, y, px: axScale(hoverTout), py: ayScale(y) };
+  }, [hoverTout, bestIdx]);
+
+  function handleArchetypeMove(e) {
+    if (bestIdx === null) return;
+    const svg = archetypeSvgRef.current;
+    if (!svg) return;
+    const rect = svg.getBoundingClientRect();
+    const clientX = e.clientX ?? (e.touches && e.touches[0] && e.touches[0].clientX);
+    if (clientX === undefined) return;
+    const relX = ((clientX - rect.left) / rect.width) * AW;
+    if (relX < AX_PAD.left || relX > AX_PAD.left + APW) {
+      setHoverTout(null);
+      return;
+    }
+    const t = AX_MIN + ((relX - AX_PAD.left) / APW) * (AX_MAX - AX_MIN);
+    setHoverTout(Math.max(AX_MIN, Math.min(AX_MAX, t)));
+  }
+
+  function handleArchetypeLeave() {
+    setHoverTout(null);
+  }
 
   const fontStack = "'Fraunces', Georgia, serif";
   const monoStack = "'JetBrains Mono', ui-monospace, monospace";
@@ -304,104 +340,38 @@ export default function App() {
           50% { transform: scale(1.1); opacity: 1; }
           100% { transform: scale(1); opacity: 1; }
         }
-        .toggle-pill {
-          width: 40px; height: 22px; border-radius: 999px;
-          position: relative; cursor: pointer; transition: background 0.2s;
-          flex-shrink: 0;
+        input.forecast-input:focus {
+          border-color: ${SKY} !important;
+          box-shadow: 0 0 0 3px ${SKY_SOFT};
         }
-        .toggle-pill::after {
-          content: ""; position: absolute; top: 2px; left: 2px;
-          width: 18px; height: 18px; border-radius: 50%;
-          background: ${PAPER}; box-shadow: 0 1px 3px rgba(42,31,26,0.2);
-          transition: transform 0.2s;
-        }
-        .toggle-pill.on::after { transform: translateX(18px); }
-        .fade-in {
-          animation: fadeIn 0.35s ease-out;
-          overflow: hidden;
-        }
-        @keyframes fadeIn {
-          from { opacity: 0; max-height: 0; }
-          to { opacity: 1; max-height: 220px; }
+        input.forecast-input::placeholder {
+          color: ${MUTED};
+          opacity: 0.5;
         }
       `}</style>
 
       <div className="max-w-md mx-auto px-5 py-8 sm:py-10">
         {/* Header */}
         <header className="mb-8">
-          <div
-            className="text-xs tracking-widest mb-3 uppercase"
-            style={{ fontFamily: monoStack, color: MUTED, letterSpacing: "0.22em" }}
-          >
-            online learning · v2
-          </div>
           <h1
             style={{
               fontFamily: fontStack,
-              fontWeight: 400,
+              fontWeight: 500,
               fontSize: "2.4rem",
               lineHeight: 1.05,
               letterSpacing: "-0.02em",
-              fontStyle: "italic",
+              color: HEAT,
             }}
           >
-            thermal<br/>
-            <span style={{ color: HEAT, fontStyle: "normal", fontWeight: 500 }}>comfort</span>
+            ComfortGPT
           </h1>
           <div
             className="mt-4 text-sm"
-            style={{ color: MUTED, lineHeight: 1.55, maxWidth: "28ch" }}
+            style={{ color: MUTED, lineHeight: 1.55, maxWidth: "32ch" }}
           >
-            A model that learns your air-conditioning preferences by watching what you set.
+            A tool that learns your preferred temperature setpoint.
           </div>
         </header>
-
-        {/* Mode toggle */}
-        <div
-          className="rounded-2xl p-4 mb-4 flex items-center justify-between gap-3"
-          style={{
-            background: useForecast ? `${SKY_SOFT}70` : "transparent",
-            border: `1px solid ${useForecast ? SKY : RULE}`,
-            transition: "all 0.25s",
-          }}
-        >
-          <div className="flex items-center gap-3">
-            <CloudSun size={18} style={{ color: useForecast ? SKY : MUTED, flexShrink: 0 }} />
-            <div>
-              <div
-                className="text-xs uppercase"
-                style={{ fontFamily: monoStack, color: useForecast ? SKY : MUTED, letterSpacing: "0.16em" }}
-              >
-                forecast mode
-              </div>
-              <div
-                style={{
-                  fontFamily: fontStack,
-                  fontSize: "0.82rem",
-                  color: MUTED,
-                  fontStyle: "italic",
-                  lineHeight: 1.35,
-                  marginTop: "2px",
-                }}
-              >
-                {useForecast
-                  ? "using tomorrow's forecast to select model (matches R)"
-                  : "uses today's Tout as fallback boost reference"}
-              </div>
-            </div>
-          </div>
-          <div
-            role="switch"
-            aria-checked={useForecast}
-            tabIndex={0}
-            className={`toggle-pill ${useForecast ? "on" : ""}`}
-            onClick={() => setUseForecast((v) => !v)}
-            onKeyDown={(e) => {
-              if (e.key === " " || e.key === "Enter") { e.preventDefault(); setUseForecast((v) => !v); }
-            }}
-            style={{ background: useForecast ? SKY : RULE }}
-          />
-        </div>
 
         {/* Main card */}
         <div
@@ -412,98 +382,14 @@ export default function App() {
             boxShadow: "0 1px 0 rgba(255,255,255,0.6) inset, 0 2px 20px rgba(42,31,26,0.04)",
           }}
         >
-          {/* Outdoor temperature */}
+          {/* Your preferred setpoint */}
           <div className="mb-7">
             <div className="flex items-baseline justify-between mb-1">
               <label
                 className="text-xs uppercase"
                 style={{ fontFamily: monoStack, color: MUTED, letterSpacing: "0.16em" }}
               >
-                outdoor temp
-              </label>
-              <span
-                className="text-xs"
-                style={{ fontFamily: monoStack, color: MUTED }}
-              >
-                {CUTOFF}–45°
-              </span>
-            </div>
-            <div className="flex items-baseline gap-2 mb-3">
-              <span
-                style={{
-                  fontFamily: fontStack,
-                  fontSize: "4rem",
-                  fontWeight: 300,
-                  lineHeight: 1,
-                  letterSpacing: "-0.04em",
-                  color: HEAT,
-                }}
-              >
-                {tout.toFixed(1)}
-              </span>
-              <span
-                style={{
-                  fontFamily: fontStack,
-                  fontSize: "1.6rem",
-                  fontWeight: 300,
-                  color: HEAT,
-                  fontStyle: "italic",
-                }}
-              >
-                °c
-              </span>
-            </div>
-            <input
-              type="range"
-              className="thermal-slider"
-              min={CUTOFF}
-              max={45}
-              step={0.5}
-              value={tout}
-              onChange={(e) => setTout(parseFloat(e.target.value))}
-            />
-          </div>
-
-          {/* Model's live prediction */}
-          <div
-            className="rounded-xl p-4 mb-7 flex items-center justify-between"
-            style={{
-              background: `linear-gradient(135deg, ${COOL_SOFT}40, transparent)`,
-              border: `1px dashed ${COOL}60`,
-            }}
-          >
-            <div>
-              <div
-                className="text-xs mb-1 uppercase"
-                style={{ fontFamily: monoStack, color: MUTED, letterSpacing: "0.16em" }}
-              >
-                model guess
-              </div>
-              <div
-                style={{
-                  fontFamily: fontStack,
-                  fontSize: "1.4rem",
-                  color: livePrediction === null ? MUTED : COOL,
-                  fontStyle: livePrediction === null ? "italic" : "normal",
-                  fontWeight: 500,
-                }}
-              >
-                {livePrediction === null
-                  ? "awaiting first reading"
-                  : `${livePrediction.toFixed(1)}°c`}
-              </div>
-            </div>
-            <Sparkles size={18} style={{ color: COOL, opacity: 0.6 }} />
-          </div>
-
-          {/* Your setpoint */}
-          <div className="mb-6">
-            <div className="flex items-baseline justify-between mb-1">
-              <label
-                className="text-xs uppercase"
-                style={{ fontFamily: monoStack, color: MUTED, letterSpacing: "0.16em" }}
-              >
-                your setpoint
+                your preferred setpoint
               </label>
               <span
                 className="text-xs"
@@ -548,68 +434,112 @@ export default function App() {
             />
           </div>
 
-          {/* Forecast next Tout (only when forecast mode is on) */}
-          {useForecast && (
-            <div className="mb-6 fade-in">
-              <div
-                className="flex items-baseline justify-between mb-1"
-                style={{ paddingTop: "4px" }}
+          {/* Outdoor temperature */}
+          <div className="mb-6">
+            <div className="flex items-baseline justify-between mb-1">
+              <label
+                className="text-xs uppercase"
+                style={{ fontFamily: monoStack, color: MUTED, letterSpacing: "0.16em" }}
               >
-                <label
-                  className="text-xs uppercase"
-                  style={{ fontFamily: monoStack, color: SKY, letterSpacing: "0.16em" }}
-                >
-                  next day forecast
-                </label>
-                <span
-                  className="text-xs"
-                  style={{ fontFamily: monoStack, color: MUTED }}
-                >
-                  T_{'{j+1}'}
-                </span>
-              </div>
-              <div className="flex items-baseline gap-2 mb-3">
-                <span
-                  style={{
-                    fontFamily: fontStack,
-                    fontSize: "2.6rem",
-                    fontWeight: 300,
-                    lineHeight: 1,
-                    letterSpacing: "-0.04em",
-                    color: SKY,
-                  }}
-                >
-                  {forecastNext.toFixed(1)}
-                </span>
-                <span
-                  style={{
-                    fontFamily: fontStack,
-                    fontSize: "1.2rem",
-                    fontWeight: 300,
-                    color: SKY,
-                    fontStyle: "italic",
-                  }}
-                >
-                  °c
-                </span>
-              </div>
-              <input
-                type="range"
-                className="thermal-slider sky"
-                min={CUTOFF}
-                max={45}
-                step={0.5}
-                value={forecastNext}
-                onChange={(e) => setForecastNext(parseFloat(e.target.value))}
-              />
-              <div
-                className="text-xs italic mt-2"
-                style={{ fontFamily: fontStack, color: MUTED, lineHeight: 1.45 }}
+                outdoor temperature
+              </label>
+              <span
+                className="text-xs"
+                style={{ fontFamily: monoStack, color: MUTED }}
               >
-                boosts weights of past days within {THRESHOLD}° of this value
-              </div>
+                {CUTOFF}–45°
+              </span>
             </div>
-          )}
+            <div className="flex items-baseline gap-2 mb-3">
+              <span
+                style={{
+                  fontFamily: fontStack,
+                  fontSize: "4rem",
+                  fontWeight: 300,
+                  lineHeight: 1,
+                  letterSpacing: "-0.04em",
+                  color: HEAT,
+                }}
+              >
+                {tout.toFixed(1)}
+              </span>
+              <span
+                style={{
+                  fontFamily: fontStack,
+                  fontSize: "1.6rem",
+                  fontWeight: 300,
+                  color: HEAT,
+                  fontStyle: "italic",
+                }}
+              >
+                °c
+              </span>
+            </div>
+            <input
+              type="range"
+              className="thermal-slider"
+              min={CUTOFF}
+              max={45}
+              step={0.5}
+              value={tout}
+              onChange={(e) => setTout(parseFloat(e.target.value))}
+            />
+          </div>
+
+          {/* Forecast Tout — compact inline input (optional) */}
+          <div className="flex items-center justify-between mb-5">
+            <div
+              style={{
+                fontFamily: monoStack,
+                fontSize: "0.72rem",
+                color: MUTED,
+                letterSpacing: "0.16em",
+                textTransform: "uppercase",
+              }}
+            >
+              forecast T<sub style={{ fontSize: "0.6rem" }}>out</sub>
+            </div>
+            <div className="flex items-baseline gap-1">
+              <input
+                type="text"
+                inputMode="decimal"
+                value={forecastTout}
+                onChange={(e) => {
+                  const v = e.target.value;
+                  // Allow empty, digits, and decimal point only
+                  if (v === "" || /^\d*\.?\d*$/.test(v)) setForecastTout(v);
+                }}
+                placeholder="—"
+                className="forecast-input"
+                style={{
+                  fontFamily: fontStack,
+                  fontSize: "1.15rem",
+                  fontWeight: 400,
+                  color: SKY,
+                  width: "68px",
+                  textAlign: "right",
+                  border: `1px solid ${RULE}`,
+                  borderRadius: 8,
+                  padding: "4px 10px",
+                  background: PAPER,
+                  outline: "none",
+                  letterSpacing: "-0.01em",
+                  transition: "border-color 0.15s",
+                }}
+              />
+              <span
+                style={{
+                  fontFamily: fontStack,
+                  fontSize: "0.95rem",
+                  fontStyle: "italic",
+                  color: SKY,
+                  marginLeft: "2px",
+                }}
+              >
+                °c
+              </span>
+            </div>
+          </div>
 
           {/* Submit */}
           <button
@@ -635,7 +565,7 @@ export default function App() {
                 <span className="pulse-check">recorded</span>
               </>
             ) : (
-              "record reading"
+              "confirm selection"
             )}
           </button>
         </div>
@@ -663,7 +593,7 @@ export default function App() {
             </div>
           </div>
 
-          {history.length === 0 ? (
+          {history.length < 2 ? (
             <div
               className="text-center py-12"
               style={{
@@ -673,17 +603,19 @@ export default function App() {
                 fontSize: "0.95rem",
               }}
             >
-              record a reading to begin
+              {history.length === 0
+                ? "record a reading to begin"
+                : "record one more reading to see the trace"}
               <div style={{ fontSize: "0.75rem", marginTop: "0.5rem", fontStyle: "normal", fontFamily: monoStack }}>
                 or try the demo below ↓
               </div>
             </div>
           ) : (
-            <div style={{ width: "100%", height: 220 }}>
+            <div style={{ width: "100%", height: 240 }}>
               <ResponsiveContainer>
                 <LineChart
                   data={chartData}
-                  margin={{ top: 10, right: 8, left: -18, bottom: 0 }}
+                  margin={{ top: 10, right: 8, left: 0, bottom: 0 }}
                 >
                   <CartesianGrid stroke={RULE} strokeDasharray="2 4" vertical={false} />
                   <XAxis
@@ -699,7 +631,20 @@ export default function App() {
                     tick={{ fontFamily: monoStack, fontSize: 11, fill: MUTED }}
                     tickLine={false}
                     axisLine={{ stroke: RULE }}
-                    width={38}
+                    width={54}
+                    label={{
+                      value: "Setpoint (°C)",
+                      angle: -90,
+                      position: "insideLeft",
+                      offset: 14,
+                      style: {
+                        fontFamily: monoStack,
+                        fontSize: 11,
+                        fill: MUTED,
+                        letterSpacing: "0.08em",
+                        textAnchor: "middle",
+                      },
+                    }}
                   />
                   <Tooltip
                     contentStyle={{
@@ -728,7 +673,7 @@ export default function App() {
                   <Line
                     type="monotone"
                     dataKey="actual"
-                    name="your setpoint"
+                    name="selected setpoint"
                     stroke={COOL}
                     strokeWidth={2}
                     dot={{ r: 4, fill: COOL, strokeWidth: 0 }}
@@ -737,7 +682,7 @@ export default function App() {
                   <Line
                     type="monotone"
                     dataKey="predicted"
-                    name="model guess"
+                    name="predicted setpoint"
                     stroke={HEAT}
                     strokeWidth={1.5}
                     strokeDasharray="4 3"
@@ -746,6 +691,296 @@ export default function App() {
                   />
                 </LineChart>
               </ResponsiveContainer>
+            </div>
+          )}
+        </div>
+
+        {/* Archetype chart: all 80 pre-trained models, selected one highlighted */}
+        <div
+          className="grain rounded-2xl p-5 mb-5"
+          style={{
+            background: PAPER,
+            border: `1px solid ${RULE}`,
+          }}
+        >
+          <div className="flex items-baseline justify-between mb-4">
+            <div
+              className="text-xs uppercase"
+              style={{ fontFamily: monoStack, color: MUTED, letterSpacing: "0.16em" }}
+            >
+              thermal archetypes
+            </div>
+            <div
+              className="text-xs"
+              style={{ fontFamily: monoStack, color: MUTED }}
+            >
+              {bestIdx !== null ? `#${bestIdx + 1} of 80` : "80 pre-trained"}
+            </div>
+          </div>
+
+          <div style={{ width: "100%" }}>
+            <svg
+              ref={archetypeSvgRef}
+              viewBox={`0 0 ${AW} ${AH}`}
+              width="100%"
+              preserveAspectRatio="xMidYMid meet"
+              onMouseMove={handleArchetypeMove}
+              onMouseLeave={handleArchetypeLeave}
+              onTouchStart={handleArchetypeMove}
+              onTouchMove={handleArchetypeMove}
+              onTouchEnd={handleArchetypeLeave}
+              style={{
+                display: "block",
+                cursor: bestIdx !== null ? "crosshair" : "default",
+                touchAction: "none",
+              }}
+            >
+              <defs>
+                <clipPath id="archetype-plot-clip">
+                  <rect
+                    x={AX_PAD.left}
+                    y={AX_PAD.top}
+                    width={APW}
+                    height={APH}
+                  />
+                </clipPath>
+              </defs>
+
+              {/* Horizontal grid lines */}
+              {[15, 18, 21, 24, 27, 30].map((y) => (
+                <line
+                  key={`gy-${y}`}
+                  x1={AX_PAD.left}
+                  y1={ayScale(y)}
+                  x2={AX_PAD.left + APW}
+                  y2={ayScale(y)}
+                  stroke={RULE}
+                  strokeDasharray="2 4"
+                  strokeWidth={0.8}
+                />
+              ))}
+
+              {/* All 80 background models in light gray */}
+              <g clipPath="url(#archetype-plot-clip)">
+                {MODEL_LINES.map((l) =>
+                  l.idx === bestIdx ? null : (
+                    <line
+                      key={`m-${l.idx}`}
+                      x1={l.x1}
+                      y1={l.y1}
+                      x2={l.x2}
+                      y2={l.y2}
+                      stroke={MUTED}
+                      strokeOpacity={0.18}
+                      strokeWidth={0.8}
+                    />
+                  )
+                )}
+              </g>
+
+              {/* Selected model highlighted in blue */}
+              {bestIdx !== null && (
+                <g clipPath="url(#archetype-plot-clip)">
+                  <line
+                    x1={MODEL_LINES[bestIdx].x1}
+                    y1={MODEL_LINES[bestIdx].y1}
+                    x2={MODEL_LINES[bestIdx].x2}
+                    y2={MODEL_LINES[bestIdx].y2}
+                    stroke={COOL}
+                    strokeWidth={2.5}
+                    strokeLinecap="round"
+                  />
+                </g>
+              )}
+
+              {/* Hover guide lines + marker */}
+              {hoverPoint && (
+                <g style={{ pointerEvents: "none" }}>
+                  <line
+                    x1={hoverPoint.px}
+                    y1={hoverPoint.py}
+                    x2={hoverPoint.px}
+                    y2={AX_PAD.top + APH}
+                    stroke={COOL}
+                    strokeWidth={1}
+                    strokeDasharray="4 3"
+                    opacity={0.75}
+                  />
+                  <line
+                    x1={AX_PAD.left}
+                    y1={hoverPoint.py}
+                    x2={hoverPoint.px}
+                    y2={hoverPoint.py}
+                    stroke={COOL}
+                    strokeWidth={1}
+                    strokeDasharray="4 3"
+                    opacity={0.75}
+                  />
+                  <circle
+                    cx={hoverPoint.px}
+                    cy={hoverPoint.py}
+                    r={5}
+                    fill={PAPER}
+                    stroke={COOL}
+                    strokeWidth={2}
+                  />
+                </g>
+              )}
+
+              {/* Y-axis */}
+              <line
+                x1={AX_PAD.left}
+                y1={AX_PAD.top}
+                x2={AX_PAD.left}
+                y2={AX_PAD.top + APH}
+                stroke={RULE}
+                strokeWidth={1}
+              />
+              {/* Y-axis ticks + labels */}
+              {[15, 18, 21, 24, 27, 30].map((y) => (
+                <g key={`yt-${y}`}>
+                  <line
+                    x1={AX_PAD.left - 4}
+                    y1={ayScale(y)}
+                    x2={AX_PAD.left}
+                    y2={ayScale(y)}
+                    stroke={MUTED}
+                    strokeWidth={1}
+                  />
+                  <text
+                    x={AX_PAD.left - 8}
+                    y={ayScale(y) + 3.5}
+                    textAnchor="end"
+                    fontFamily={monoStack}
+                    fontSize={10}
+                    fill={MUTED}
+                  >
+                    {y}
+                  </text>
+                </g>
+              ))}
+              {/* Y-axis title */}
+              <text
+                transform={`translate(14, ${AX_PAD.top + APH / 2}) rotate(-90)`}
+                textAnchor="middle"
+                fontFamily={monoStack}
+                fontSize={10}
+                fill={MUTED}
+                letterSpacing="0.05em"
+              >
+                Preferred Setpoint (°C)
+              </text>
+
+              {/* X-axis */}
+              <line
+                x1={AX_PAD.left}
+                y1={AX_PAD.top + APH}
+                x2={AX_PAD.left + APW}
+                y2={AX_PAD.top + APH}
+                stroke={RULE}
+                strokeWidth={1}
+              />
+              {/* X-axis ticks + labels */}
+              {[18, 24, 30, 36, 42].map((x) => (
+                <g key={`xt-${x}`}>
+                  <line
+                    x1={axScale(x)}
+                    y1={AX_PAD.top + APH}
+                    x2={axScale(x)}
+                    y2={AX_PAD.top + APH + 4}
+                    stroke={MUTED}
+                    strokeWidth={1}
+                  />
+                  <text
+                    x={axScale(x)}
+                    y={AX_PAD.top + APH + 15}
+                    textAnchor="middle"
+                    fontFamily={monoStack}
+                    fontSize={10}
+                    fill={MUTED}
+                  >
+                    {x}
+                  </text>
+                </g>
+              ))}
+              {/* X-axis title */}
+              <text
+                x={AX_PAD.left + APW / 2}
+                y={AH - 8}
+                textAnchor="middle"
+                fontFamily={monoStack}
+                fontSize={10}
+                fill={MUTED}
+                letterSpacing="0.05em"
+              >
+                Outdoor Temperature (°C)
+              </text>
+
+              {/* Hover tooltip */}
+              {hoverPoint && (() => {
+                const tipW = 118;
+                const tipH = 36;
+                // keep tooltip inside plot area
+                let tx = hoverPoint.px + 10;
+                if (tx + tipW > AX_PAD.left + APW) tx = hoverPoint.px - tipW - 10;
+                let ty = hoverPoint.py - tipH - 8;
+                if (ty < AX_PAD.top) ty = hoverPoint.py + 10;
+                return (
+                  <g
+                    transform={`translate(${tx}, ${ty})`}
+                    style={{ pointerEvents: "none" }}
+                  >
+                    <rect
+                      x={0}
+                      y={0}
+                      width={tipW}
+                      height={tipH}
+                      rx={6}
+                      fill={PAPER}
+                      stroke={RULE}
+                      strokeWidth={1}
+                    />
+                    <text
+                      x={9}
+                      y={14}
+                      fontFamily={monoStack}
+                      fontSize={9}
+                      fill={MUTED}
+                      letterSpacing="0.04em"
+                    >
+                      T<tspan dy="2" fontSize={7}>out</tspan>
+                      <tspan dy="-2">: {hoverPoint.x.toFixed(1)}°C</tspan>
+                    </text>
+                    <text
+                      x={9}
+                      y={28}
+                      fontFamily={monoStack}
+                      fontSize={9}
+                      fill={COOL}
+                      fontWeight={600}
+                    >
+                      Setpoint: {hoverPoint.y.toFixed(1)}°C
+                    </text>
+                  </g>
+                );
+              })()}
+            </svg>
+          </div>
+
+          {bestIdx === null && (
+            <div
+              className="text-center text-xs italic mt-2"
+              style={{ fontFamily: fontStack, color: MUTED }}
+            >
+              confirm a selection to highlight your archetype
+            </div>
+          )}
+          {bestIdx !== null && (
+            <div
+              className="text-xs italic mt-2 text-center"
+              style={{ fontFamily: fontStack, color: MUTED }}
+            >
+              hover the blue line to read predicted setpoints
             </div>
           )}
         </div>
@@ -762,9 +997,9 @@ export default function App() {
             className="text-xs uppercase mb-4"
             style={{ fontFamily: monoStack, color: MUTED, letterSpacing: "0.16em" }}
           >
-            current fit
+            current thermal archetype
           </div>
-          <div className="grid grid-cols-3 gap-3 mb-4">
+          <div className="grid grid-cols-2 gap-3 mb-4">
             <StatCell
               label="slope"
               value={currentModel ? currentModel.s.toFixed(4) : "—"}
@@ -777,15 +1012,6 @@ export default function App() {
               mono={monoStack}
               serif={fontStack}
             />
-            <StatCell
-              label="mean err"
-              value={
-                stats.mean !== null ? `${stats.mean.toFixed(2)}°` : "—"
-              }
-              mono={monoStack}
-              serif={fontStack}
-              accent={HEAT}
-            />
           </div>
           {currentModel && (
             <div
@@ -797,7 +1023,7 @@ export default function App() {
                 lineHeight: 1.5,
               }}
             >
-              setpoint ≈ {currentModel.s >= 0 ? "+" : ""}
+              Predicted setpoint = {currentModel.s >= 0 ? "+" : ""}
               {currentModel.s.toFixed(4)} × T
               <sub>out</sub> + {currentModel.i.toFixed(2)}
             </div>
@@ -848,9 +1074,7 @@ export default function App() {
           className="text-xs text-center pb-4"
           style={{ color: MUTED, fontFamily: fontStack, fontStyle: "italic", lineHeight: 1.6 }}
         >
-          80 pretrained models · α = {ALPHA} · threshold = {THRESHOLD}°
-          <br />
-          boost ref: {useForecast ? "next-day forecast (R-style)" : "current T (fallback)"}
+          80 pretrained archetypes · α = {ALPHA} · threshold = {THRESHOLD}°
         </div>
       </div>
     </div>
